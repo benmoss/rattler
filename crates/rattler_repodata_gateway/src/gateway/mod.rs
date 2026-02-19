@@ -26,7 +26,7 @@ use coalesced_map::{CoalescedGetError, CoalescedMap};
 pub use error::GatewayError;
 #[cfg(feature = "indicatif")]
 pub use indicatif::{IndicatifReporter, IndicatifReporterBuilder};
-pub use query::{NamesQuery, RepoDataQuery};
+pub use query::{AllPackagesQuery, NamesQuery, RepoDataQuery};
 #[cfg(not(target_arch = "wasm32"))]
 use rattler_cache::package_cache::PackageCache;
 use rattler_conda_types::{Channel, MatchSpec, Platform, RepoDataRecord};
@@ -176,6 +176,29 @@ impl Gateway {
         <PlatformIter as IntoIterator>::IntoIter: Clone,
     {
         NamesQuery::new(
+            self.inner.clone(),
+            channels.into_iter().map(Into::into).collect(),
+            platforms.into_iter().collect(),
+        )
+    }
+
+    /// Iterate over all packages in the given channels and platforms.
+    ///
+    /// Returns an [`AllPackagesQuery`] that can be used to process each package
+    /// one at a time via [`AllPackagesQuery::for_each`], or to compute the
+    /// latest version of every package via [`AllPackagesQuery::latest_versions`].
+    pub fn all_packages<AsChannel, ChannelIter, PlatformIter>(
+        &self,
+        channels: ChannelIter,
+        platforms: PlatformIter,
+    ) -> AllPackagesQuery
+    where
+        AsChannel: Into<Channel>,
+        ChannelIter: IntoIterator<Item = AsChannel>,
+        PlatformIter: IntoIterator<Item = Platform>,
+        <PlatformIter as IntoIterator>::IntoIter: Clone,
+    {
+        AllPackagesQuery::new(
             self.inner.clone(),
             channels.into_iter().map(Into::into).collect(),
             platforms.into_iter().collect(),

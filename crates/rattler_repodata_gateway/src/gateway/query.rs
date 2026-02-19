@@ -642,3 +642,176 @@ impl IntoFuture for NamesQuery {
         box_future(self.execute())
     }
 }
+
+/// Represents a query that iterates over all packages in a set of channels,
+/// invoking a callback for each package name and its associated records.
+///
+/// This avoids materializing every record into memory at once: records for each
+/// package are fetched, handed to the callback, and then dropped before moving
+/// on to the next package.
+///
+/// Construct via [`Gateway::all_packages`].
+pub struct AllPackagesQuery {
+    /// The gateway that manages all resources
+    gateway: Arc<GatewayInner>,
+
+    /// The channels to fetch from
+    channels: Vec<Channel>,
+
+    /// The platforms to fetch from
+    platforms: Vec<Platform>,
+
+    /// The reporter to use by the query.
+    reporter: Option<Arc<dyn Reporter>>,
+}
+
+impl AllPackagesQuery {
+    /// Constructs a new instance. This should not be called directly, use
+    /// [`Gateway::all_packages`] instead.
+    pub(super) fn new(
+        gateway: Arc<GatewayInner>,
+        channels: Vec<Channel>,
+        platforms: Vec<Platform>,
+    ) -> Self {
+        Self {
+            gateway,
+            channels,
+            platforms,
+            reporter: None,
+        }
+    }
+
+    /// Sets the reporter to use for this query.
+    ///
+    /// The reporter is notified of important events during the execution of the
+    /// query. This allows reporting progress back to a user.
+    pub fn with_reporter(self, reporter: impl Reporter + 'static) -> Self {
+        Self {
+            reporter: Some(Arc::new(reporter)),
+            ..self
+        }
+    }
+
+    /// Iterate over every package in the selected channels and platforms,
+    /// calling `callback` once per unique package name with the combined
+    /// records from all matching subdirectories.
+    ///
+    /// Records are dropped after each invocation so memory usage stays
+    /// proportional to a single package rather than the entire channel.
+    ///
+    /// Shard fetches are performed concurrently (bounded by the gateway's
+    /// concurrency semaphore) for throughput.
+    pub async fn for_each<F>(self, mut callback: F) -> Result<(), GatewayError>
+    where
+        F: FnMut(&str, &[Arc<RepoDataRecord>]),
+    {
+        // Collect all channels × platforms into subdirs
+        let channels_and_platforms = self
+            .channels
+            .iter()
+            .cartesian_product(self.platforms.into_iter())
+            .collect_vec();
+
+        let mut pending_subdirs = FuturesUnordered::new();
+        for (channel, platform) in channels_and_platforms {
+            let inner = self.gateway.clone();
+            let reporter = self.reporter.clone();
+            pending_subdirs.push(async move {
+                inner
+                    .get_or_create_subdir(channel, platform, reporter)
+                    .await
+            });
+        }
+
+        // Wait for all subdirs and collect package names
+        let mut subdirs: Vec<Arc<Subdir>> = Vec::new();
+        let mut all_names: HashSet<String> = HashSet::new();
+
+        while let Some(result) = pending_subdirs.next().await {
+            let subdir = result?;
+            if let Some(names) = subdir.package_names() {
+                all_names.extend(names);
+            }
+            subdirs.push(subdir);
+        }
+
+        let total = all_names.len();
+        tracing::info!("all_packages: fetching records for {total} unique package names");
+
+        // Fetch records for all packages concurrently. Each future fetches
+        // records from all subdirs for one package name.
+        let subdirs = Arc::new(subdirs);
+        let reporter = self.reporter.clone();
+
+        let mut pending = FuturesUnordered::new();
+        let mut names_iter = all_names.iter();
+        // Seed with an initial batch of concurrent fetches
+        const CONCURRENCY: usize = 50;
+        for _ in 0..CONCURRENCY {
+            if let Some(name_str) = names_iter.next() {
+                let subdirs = subdirs.clone();
+                let reporter = reporter.clone();
+                let name_str = name_str.clone();
+                pending.push(box_future(async move {
+                    fetch_all_subdir_records(&name_str, &subdirs, reporter).await
+                }));
+            }
+        }
+
+        let mut completed: usize = 0;
+        while let Some(result) = pending.next().await {
+            let (name, combined_records) = result?;
+
+            if !combined_records.is_empty() {
+                callback(&name, &combined_records);
+            }
+
+            completed += 1;
+            if completed % 1000 == 0 {
+                tracing::info!("all_packages: {completed}/{total} packages processed");
+            }
+
+            // Schedule the next package
+            if let Some(name_str) = names_iter.next() {
+                let subdirs = subdirs.clone();
+                let reporter = reporter.clone();
+                let name_str = name_str.clone();
+                pending.push(box_future(async move {
+                    fetch_all_subdir_records(&name_str, &subdirs, reporter).await
+                }));
+            }
+        }
+
+        tracing::info!("all_packages: done, {completed} packages processed");
+        Ok(())
+    }
+
+}
+
+/// Fetch records for a single package from all subdirs, returning the
+/// package name and the combined records.
+async fn fetch_all_subdir_records(
+    name_str: &str,
+    subdirs: &[Arc<Subdir>],
+    reporter: Option<Arc<dyn Reporter>>,
+) -> Result<(String, Vec<Arc<RepoDataRecord>>), GatewayError> {
+    let Ok(package_name) = PackageName::try_from(name_str) else {
+        return Ok((name_str.to_string(), Vec::new()));
+    };
+
+    let mut combined_records: Vec<Arc<RepoDataRecord>> = Vec::new();
+
+    for subdir in subdirs {
+        match subdir.as_ref() {
+            Subdir::Found(subdir_data) => {
+                let pkg = subdir_data
+                    .get_or_fetch_package_records(&package_name, reporter.clone())
+                    .await?;
+                combined_records.extend(pkg.records);
+            }
+            Subdir::NotFound => {}
+        }
+    }
+
+    Ok((name_str.to_string(), combined_records))
+}
